@@ -1,0 +1,49 @@
+name: Indexer CI
+
+on:
+  push:
+    paths:
+      - 'indexer/**'
+      - 'package.json'
+  pull_request:
+    paths:
+      - 'indexer/**'
+      - 'package.json'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build + Tests + Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: indexer/package-lock.json
+
+      - name: Install dependencies
+        working-directory: indexer
+        run: npm ci
+
+      - name: Build
+        working-directory: indexer
+        run: npm run build
+
+      - name: Test with coverage
+        working-directory: indexer
+        run: npm run test:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: indexer-coverage
+          path: indexer/coverage/
+          retention-days: 7

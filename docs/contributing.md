@@ -12,6 +12,7 @@ Thank you for your interest in contributing to BANKERCHANGER! This document prov
 - [Local Contract Testing](#local-contract-testing)
 - [Testing](#testing)
 - [Code Review](#code-review)
+- [Architecture Decision Records](#architecture-decision-records)
 - [Deployment](#deployment)
 - [Reporting Issues](#reporting-issues)
 
@@ -223,6 +224,12 @@ Reviewers will check for:
 - Security implications (input validation, auth checks).
 - Performance impact (database queries, caching).
 - Documentation for public APIs and complex logic.
+
+## Architecture Decision Records
+
+For significant architectural changes, document the context, alternatives,
+trade-offs, and rationale in an ADR. Follow the [ADR process](adr/README.md),
+including its template and status conventions.
 
 ## Deployment
 

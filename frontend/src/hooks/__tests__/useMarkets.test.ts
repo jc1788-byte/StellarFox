@@ -4,8 +4,8 @@
 
 import { renderHook, waitFor } from '@testing-library/react';
 import { useMarkets } from '../../hooks/useMarkets';
-import { server } from '../mocks/handlers';
-import { mockMarkets } from '../mocks/handlers';
+import { server } from '../../__tests__/mocks/handlers';
+import { mockMarkets } from '../../__tests__/mocks/handlers';
 import { http, HttpResponse } from 'msw';
 
 describe('useMarkets', () => {

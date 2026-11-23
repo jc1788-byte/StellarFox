@@ -11,11 +11,35 @@
 interface HealthState {
   lastLedger: number | null;
   lastUpdate: Date | null;
+  dependencies: {
+    database: {
+      healthy: boolean;
+      lastChecked: Date | null;
+      error: string | null;
+    };
+    rpc: {
+      healthy: boolean;
+      lastChecked: Date | null;
+      error: string | null;
+    };
+  };
 }
 
 const state: HealthState = {
   lastLedger: null,
   lastUpdate: null,
+  dependencies: {
+    database: {
+      healthy: false,
+      lastChecked: null,
+      error: null,
+    },
+    rpc: {
+      healthy: false,
+      lastChecked: null,
+      error: null,
+    },
+  },
 };
 
 /**
@@ -26,6 +50,11 @@ const state: HealthState = {
 const MAX_CURSOR_AGE_MS = 5 * 60 * 1000;
 
 /**
+ * Maximum allowed age of dependency checks before they're considered stale
+ */
+const MAX_DEPENDENCY_CHECK_AGE_MS = 30 * 1000; // 30 seconds
+
+/**
  * Update the last processed ledger
  */
 export function updateLastLedger(ledger: number): void {
@@ -34,15 +63,47 @@ export function updateLastLedger(ledger: number): void {
 }
 
 /**
+ * Update dependency health status (database)
+ */
+export function setDatabaseHealth(healthy: boolean, error?: string): void {
+  state.dependencies.database.healthy = healthy;
+  state.dependencies.database.lastChecked = new Date();
+  state.dependencies.database.error = error ?? null;
+}
+
+/**
+ * Update dependency health status (RPC)
+ */
+export function setRpcHealth(healthy: boolean, error?: string): void {
+  state.dependencies.rpc.healthy = healthy;
+  state.dependencies.rpc.lastChecked = new Date();
+  state.dependencies.rpc.error = error ?? null;
+}
+
+/**
  * Get the current health state
  */
-export function getHealthState(): { lastLedger: number | null; cursorAge: number | null } {
+export function getHealthState(): { 
+  lastLedger: number | null; 
+  cursorAge: number | null;
+  dependencies: typeof state.dependencies;
+} {
   const cursorAge = state.lastUpdate ? Date.now() - state.lastUpdate.getTime() : null;
 
   return {
     lastLedger: state.lastLedger,
     cursorAge,
+    dependencies: state.dependencies,
   };
+}
+
+/**
+ * Check if a dependency check is fresh (not stale)
+ */
+function isDependencyCheckFresh(lastChecked: Date | null): boolean {
+  if (!lastChecked) return false;
+  const age = Date.now() - lastChecked.getTime();
+  return age <= MAX_DEPENDENCY_CHECK_AGE_MS;
 }
 
 /**
@@ -61,6 +122,8 @@ export function isLive(): boolean {
  * Ready if:
  * - At least one ledger has been processed (cursor has advanced)
  * - Cursor is not stale (updated within MAX_CURSOR_AGE_MS)
+ * - Database is healthy and recently checked
+ * - RPC is healthy and recently checked
  */
 export function isReady(): boolean {
   // Check if we've ever processed a ledger
@@ -74,6 +137,20 @@ export function isReady(): boolean {
     return false;
   }
 
+  // Check database health (if recently checked and not healthy, fail)
+  if (isDependencyCheckFresh(state.dependencies.database.lastChecked)) {
+    if (!state.dependencies.database.healthy) {
+      return false;
+    }
+  }
+
+  // Check RPC health (if recently checked and not healthy, fail)
+  if (isDependencyCheckFresh(state.dependencies.rpc.lastChecked)) {
+    if (!state.dependencies.rpc.healthy) {
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -85,6 +162,18 @@ export function getReadinessDetails(): {
   lastLedger: number | null;
   cursorAge: number | null;
   maxCursorAge: number;
+  dependencies: {
+    database: {
+      healthy: boolean;
+      lastCheckedAgo: number | null;
+      error: string | null;
+    };
+    rpc: {
+      healthy: boolean;
+      lastCheckedAgo: number | null;
+      error: string | null;
+    };
+  };
   reasons: string[];
 } {
   const health = getHealthState();
@@ -102,11 +191,38 @@ export function getReadinessDetails(): {
     );
   }
 
+  const dbCheckAge = state.dependencies.database.lastChecked 
+    ? Date.now() - state.dependencies.database.lastChecked.getTime() 
+    : null;
+  const rpcCheckAge = state.dependencies.rpc.lastChecked 
+    ? Date.now() - state.dependencies.rpc.lastChecked.getTime() 
+    : null;
+
+  if (isDependencyCheckFresh(state.dependencies.database.lastChecked) && !state.dependencies.database.healthy) {
+    reasons.push(`Database unhealthy: ${state.dependencies.database.error || 'unknown error'}`);
+  }
+
+  if (isDependencyCheckFresh(state.dependencies.rpc.lastChecked) && !state.dependencies.rpc.healthy) {
+    reasons.push(`RPC unhealthy: ${state.dependencies.rpc.error || 'unknown error'}`);
+  }
+
   return {
     ready: reasons.length === 0,
     lastLedger: health.lastLedger,
     cursorAge: health.cursorAge,
     maxCursorAge: MAX_CURSOR_AGE_MS,
+    dependencies: {
+      database: {
+        healthy: state.dependencies.database.healthy,
+        lastCheckedAgo: dbCheckAge,
+        error: state.dependencies.database.error,
+      },
+      rpc: {
+        healthy: state.dependencies.rpc.healthy,
+        lastCheckedAgo: rpcCheckAge,
+        error: state.dependencies.rpc.error,
+      },
+    },
     reasons,
   };
 }

@@ -1,8 +1,11 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
-import { getInvoices, getInvoiceById } from './db';
+import { getInvoices, getInvoiceById, checkDatabaseHealth } from './db';
 import { getPollerHealth } from './poller';
-import { isLive, isReady, getReadinessDetails } from './health';
+import { isLive, isReady, getReadinessDetails, setDatabaseHealth } from './health';
+import { getMetricsSnapshot, getPrometheusMetrics } from './metrics';
+import { getCheckpointStats, getAllCheckpoints, getRecoveryInfo } from './checkpointRecovery';
+import { getEventFilter, getSamplingConfig, getFilteringStats } from './eventFiltering';
 
 const app = express();
 
@@ -41,8 +44,12 @@ app.get('/healthz/live', (req: Request, res: Response) => {
  *  - Cursor has advanced (recent activity)
  * Used by Kubernetes to add/remove from load balancer.
  */
-app.get('/healthz/ready', (req: Request, res: Response) => {
+app.get('/healthz/ready', async (req: Request, res: Response) => {
   try {
+    // Check database health
+    const dbHealth = await checkDatabaseHealth();
+    setDatabaseHealth(dbHealth.healthy, dbHealth.error);
+
     const ready = isReady();
     const details = getReadinessDetails();
     const statusCode = ready ? 200 : 503;
@@ -53,6 +60,7 @@ app.get('/healthz/ready', (req: Request, res: Response) => {
       lastLedger: details.lastLedger,
       cursorAge: details.cursorAge,
       maxCursorAge: details.maxCursorAge,
+      dependencies: details.dependencies,
       reasons: details.reasons,
       timestamp: new Date().toISOString(),
     });
@@ -100,6 +108,87 @@ app.get('/health', (req: Request, res: Response) => {
       success: false, 
       status: 'error',
       error: err.message 
+    });
+  }
+});
+
+/**
+ * Metrics endpoint: Returns detailed event processing metrics
+ * Useful for monitoring and alerting
+ */
+app.get('/metrics/events', (req: Request, res: Response) => {
+  try {
+    const metrics = getMetricsSnapshot();
+    res.json({
+      success: true,
+      data: metrics,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+/**
+ * Prometheus metrics endpoint: Returns metrics in Prometheus format
+ * Compatible with Prometheus scraper and Grafana
+ */
+app.get('/metrics', (req: Request, res: Response) => {
+  try {
+    const metrics = getPrometheusMetrics();
+    res.set('Content-Type', 'text/plain; charset=utf-8');
+    res.send(metrics);
+  } catch (err: any) {
+    res.status(500).send(`# Error: ${err.message}`);
+  }
+});
+
+/**
+ * Checkpoint recovery endpoint: Returns checkpoint statistics
+ */
+app.get('/checkpoints/status', (req: Request, res: Response) => {
+  try {
+    const stats = getCheckpointStats();
+    const recovery = getRecoveryInfo();
+    res.json({
+      success: true,
+      data: {
+        stats,
+        recovery,
+        allCheckpoints: getAllCheckpoints(),
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+/**
+ * Event filtering status endpoint: Returns current filter and sampling config
+ */
+app.get('/filtering/status', (req: Request, res: Response) => {
+  try {
+    const filteringStats = getFilteringStats();
+    res.json({
+      success: true,
+      data: {
+        filter: getEventFilter(),
+        sampling: getSamplingConfig(),
+        stats: filteringStats,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
     });
   }
 });

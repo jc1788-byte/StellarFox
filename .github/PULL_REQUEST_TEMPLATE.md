@@ -19,6 +19,7 @@ Closes #
 - [ ] I have read `docs/contributing.md`
 - [ ] My code follows the naming conventions in the guidelines
 - [ ] I have added or updated tests for my changes
+- [ ] Public APIs include TSDoc/JSDoc or rustdoc; documentation coverage did not decrease
 - [ ] All tests pass locally (`cargo test` / `npm test`)
 - [ ] Lint passes (`cargo clippy` / `npm run lint`)
 - [ ] No `console.log` or `unwrap()` left in production paths

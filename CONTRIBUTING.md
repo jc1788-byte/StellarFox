@@ -93,3 +93,7 @@ Types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`.
 ## Reporting Bugs
 
 Open a GitHub Issue using the bug report template. Include reproduction steps, expected vs actual behaviour, and environment details.
+
+## Tracking Technical Debt
+
+Record ongoing costs caused by design or implementation shortcuts as GitHub issues using the [Technical debt template](.github/ISSUE_TEMPLATE/technical-debt.yml). The issue backlog is the source of truth; use the [technical debt management guide](docs/technical-debt-management.md) to score, prioritize, plan remediation, and generate portfolio metrics.

@@ -7,6 +7,7 @@
 // ============================================================
 
 import { pool } from '../config/db';
+import { isMarketCategory } from '../models/MarketCategory';
 import { rpc, Address, xdr } from '@stellar/stellar-sdk';
 import { subscribeToContractEvents, fetchHistoricalEvents } from '../services/StellarService';
 import { cacheDeletePattern } from '../services/cache.service';
@@ -17,6 +18,8 @@ import {
   getLastProcessedLedger as getTrackerLastProcessed,
   recordProcessedRange,
 } from './ledgerTracker';
+import { getProvider, executeWithFailover, recordSuccess, recordFailure, initializeProviders } from '../services/rpcProvider.service';
+import { logger } from '../utils/logger';
 
 // Raw event shape returned by Stellar RPC / Horizon
 export interface RawStellarEvent {
@@ -33,7 +36,16 @@ const RPC_URL = process.env.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.
 const FACTORY_CONTRACT = process.env.FACTORY_CONTRACT_ADDRESS || '';
 const TREASURY_CONTRACT = process.env.TREASURY_CONTRACT_ADDRESS || '';
 
-const server = new rpc.Server(RPC_URL);
+// Dynamic RPC provider
+let server: rpc.Server;
+
+async function getServer(): Promise<rpc.Server> {
+  if (!server) {
+    const provider = await getProvider();
+    server = new rpc.Server(provider.url);
+  }
+  return server;
+}
 
 /**
  * Publishes to the WebSocket activity feed, if one has been initialised.
@@ -100,6 +112,15 @@ function isLedgerRangeError(err: unknown): boolean {
 
 export async function startIndexer(): Promise<void> {
   const pollInterval = Number(process.env.POLL_INTERVAL_MS ?? 5000);
+  
+  // Initialize RPC providers
+  try {
+    await initializeProviders();
+  } catch (err) {
+    logger.error({ err }, 'Failed to initialize RPC providers');
+    throw err;
+  }
+
   let lastProcessed = await getLastProcessedLedger();
 
   console.log(`[Indexer] Starting from ledger ${lastProcessed}`);
@@ -186,13 +207,20 @@ export async function startIndexer(): Promise<void> {
 }
 
 export async function pollOnce(lastProcessed: number): Promise<number> {
-  const latestLedgerResponse = await server.getLatestLedger();
-  const latestLedger = latestLedgerResponse.sequence;
+  // Get latest ledger with failover support
+  const latestLedger = await executeWithFailover(async (provider) => {
+    const serverInstance = new rpc.Server(provider.url);
+    const latestLedgerResponse = await serverInstance.getLatestLedger();
+    return latestLedgerResponse.sequence;
+  });
 
   if (latestLedger < lastProcessed) {
-    console.warn(
-      `[Indexer] Re-org detected: latest ledger ${latestLedger} is behind ` +
-      `last processed ${lastProcessed}. Resuming from tip without replaying backward.`,
+    logger.warn(
+      {
+        latestLedger,
+        lastProcessed,
+      },
+      'Re-org detected: latest ledger is behind last processed, resuming from tip'
     );
     await saveCheckpoint(latestLedger);
     return latestLedger;
@@ -203,12 +231,16 @@ export async function pollOnce(lastProcessed: number): Promise<number> {
     const ranges = await getProcessedRanges();
     const missing = findMissingRanges(fromLedger + 1, latestLedger, ranges);
     for (const range of missing) {
-      console.log(`[Indexer] Backfilling missing ledgers ${range.start}–${range.end}`);
+      logger.info(
+        { start: range.start, end: range.end },
+        'Backfilling missing ledgers'
+      );
       await backfillAndRecord(range.start, range.end);
       lastProcessed = Math.max(lastProcessed, range.end);
     }
   } catch (err) {
     // Fallback if table not ready
+    logger.debug({ err }, 'Ledger tracker not ready, continuing with standard polling');
   }
 
   for (let seq = lastProcessed + 1; seq <= latestLedger; seq++) {
@@ -216,7 +248,10 @@ export async function pollOnce(lastProcessed: number): Promise<number> {
       await processLedger(seq);
     } catch (err) {
       if (isLedgerRangeError(err)) {
-        console.warn(`[Indexer] Ledger ${seq} unavailable (pruned/out of range), skipping`, err);
+        logger.warn(
+          { ledger: seq },
+          'Ledger unavailable (pruned/out of range), skipping'
+        );
       } else {
         throw err;
       }
@@ -366,60 +401,63 @@ function buildEventPayload(
 // ---------------------------------------------------------------------------
 
 export async function processLedger(ledger_sequence: number): Promise<void> {
-  const request: rpc.Api.GetEventsRequest = {
-    startLedger: ledger_sequence,
-    filters: [
-      {
-        type: 'contract',
-        contractIds: [FACTORY_CONTRACT, TREASURY_CONTRACT].filter(id => id),
-        topics: [['*']]
-      }
-    ],
-    limit: 100
-  };
-
-  const response = await server.getEvents(request);
-  if (!response.events || response.events.length === 0) {
-    return;
-  }
-
-  for (const event of response.events) {
-    const contractId = typeof event.contractId === 'string' ? event.contractId : event.contractId?.toString() || '';
-    const eventType = (event.topic[0] as any)?.sym()?.toString() || 'unknown';
-    const payload = buildEventPayload(eventType, event.topic, event.value);
-    const data = JSON.stringify(payload);
-
-    const rawEvent: RawStellarEvent = {
-      contract_address: contractId,
-      event_type: eventType,
-      topics: event.topic.map((t: any) => scvToString(t)),
-      data,
-      ledger_sequence: event.ledger,
-      ledger_close_time: event.ledgerClosedAt,
-      tx_hash: event.txHash
+  return executeWithFailover(async (provider) => {
+    const server = new rpc.Server(provider.url);
+    const request: rpc.Api.GetEventsRequest = {
+      startLedger: ledger_sequence,
+      filters: [
+        {
+          type: 'contract',
+          contractIds: [FACTORY_CONTRACT, TREASURY_CONTRACT].filter(id => id),
+          topics: [['*']]
+        }
+      ],
+      limit: 100
     };
 
-    await pool.query(
-      `INSERT INTO blockchain_events
-         (contract_address, event_type, payload, ledger_sequence, ledger_close_time, tx_hash)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (tx_hash) DO UPDATE
-         SET contract_address  = EXCLUDED.contract_address,
-             event_type        = EXCLUDED.event_type,
-             payload           = EXCLUDED.payload,
-             ledger_close_time = EXCLUDED.ledger_close_time`,
-      [
-        rawEvent.contract_address,
-        rawEvent.event_type,
-        rawEvent.data,
-        rawEvent.ledger_sequence,
-        rawEvent.ledger_close_time,
-        rawEvent.tx_hash
-      ]
-    );
+    const response = await server.getEvents(request);
+    if (!response.events || response.events.length === 0) {
+      return;
+    }
 
-    await processEvent(rawEvent);
-  }
+    for (const event of response.events) {
+      const contractId = typeof event.contractId === 'string' ? event.contractId : event.contractId?.toString() || '';
+      const eventType = (event.topic[0] as any)?.sym()?.toString() || 'unknown';
+      const payload = buildEventPayload(eventType, event.topic, event.value);
+      const data = JSON.stringify(payload);
+
+      const rawEvent: RawStellarEvent = {
+        contract_address: contractId,
+        event_type: eventType,
+        topics: event.topic.map((t: any) => scvToString(t)),
+        data,
+        ledger_sequence: event.ledger,
+        ledger_close_time: event.ledgerClosedAt,
+        tx_hash: event.txHash
+      };
+
+      await pool.query(
+        `INSERT INTO blockchain_events
+           (contract_address, event_type, payload, ledger_sequence, ledger_close_time, tx_hash)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (tx_hash) DO UPDATE
+           SET contract_address  = EXCLUDED.contract_address,
+               event_type        = EXCLUDED.event_type,
+               payload           = EXCLUDED.payload,
+               ledger_close_time = EXCLUDED.ledger_close_time`,
+        [
+          rawEvent.contract_address,
+          rawEvent.event_type,
+          rawEvent.data,
+          rawEvent.ledger_sequence,
+          rawEvent.ledger_close_time,
+          rawEvent.tx_hash
+        ]
+      );
+
+      await processEvent(rawEvent);
+    }
+  });
 }
 
 export const EVENT_HANDLERS: Record<string, (event: RawStellarEvent) => Promise<void>> = {
@@ -491,6 +529,7 @@ export async function handleMarketCreated(event: RawStellarEvent): Promise<void>
       match_id: p.match_id ?? '',
       fighter_a: p.fighter_a ?? '',
       fighter_b: p.fighter_b ?? '',
+      category: isMarketCategory(p.category) ? p.category : 'OTHER',
       weight_class: p.weight_class ?? '',
       title_fight: p.title_fight ?? false,
       venue: p.venue ?? '',
@@ -503,9 +542,9 @@ export async function handleMarketCreated(event: RawStellarEvent): Promise<void>
 
     await pool.query(
       `INSERT INTO markets
-         (market_id, contract_address, match_id, fighter_a, fighter_b,
+         (market_id, contract_address, match_id, fighter_a, fighter_b, category,
           weight_class, title_fight, venue, scheduled_at, fee_bps, lock_before_secs, status, ledger_sequence)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        ON CONFLICT (market_id) DO NOTHING`,
       [
         marketData.market_id,
@@ -513,6 +552,7 @@ export async function handleMarketCreated(event: RawStellarEvent): Promise<void>
         marketData.match_id,
         marketData.fighter_a,
         marketData.fighter_b,
+        marketData.category,
         marketData.weight_class,
         marketData.title_fight,
         marketData.venue,
@@ -607,13 +647,35 @@ export async function handleMarketResolved(event: RawStellarEvent): Promise<void
     if (!marketId) {
       throw new Error('Missing market_id in MarketResolved event');
     }
+    if (!outcome || !['fighter_a', 'fighter_b', 'draw', 'no_contest'].includes(outcome)) {
+      throw new Error(`Invalid outcome in MarketResolved event: ${String(outcome)}`);
+    }
 
-    await client.query(
+    const { rows: existingMarkets } = await client.query(
+      `SELECT status, outcome FROM markets WHERE market_id = $1 FOR UPDATE`,
+      [marketId],
+    );
+    const existingMarket = existingMarkets[0];
+    if (!existingMarket) {
+      throw new Error(`Cannot resolve unknown market: ${marketId}`);
+    }
+    if (existingMarket.status === 'cancelled') {
+      throw new Error(`Cannot resolve cancelled market: ${marketId}`);
+    }
+    if (existingMarket.status === 'resolved' && existingMarket.outcome !== outcome) {
+      throw new Error(`Conflicting resolution for market: ${marketId}`);
+    }
+
+    const { rows: updatedMarkets } = await client.query(
       `UPDATE markets
           SET status = 'resolved', outcome = $1, resolved_at = $2, oracle_used = $3, updated_at = NOW()
-        WHERE market_id = $4`,
+        WHERE market_id = $4
+        RETURNING market_id, status, outcome`,
       [outcome, resolvedAt, oracleAddress ?? null, marketId],
     );
+    if (updatedMarkets.length !== 1 || updatedMarkets[0].status !== 'resolved' || updatedMarkets[0].outcome !== outcome) {
+      throw new Error(`Market resolution state validation failed: ${marketId}`);
+    }
 
     await client.query(
       `INSERT INTO oracle_reports
@@ -630,17 +692,32 @@ export async function handleMarketResolved(event: RawStellarEvent): Promise<void
       ],
     );
 
-    const { rows: bettors } = await client.query(
-      `SELECT DISTINCT bettor_address FROM bets WHERE market_id = $1`,
-      [marketId]
-    );
-
-    for (const bettor of bettors) {
-      await client.query(
-        `INSERT INTO notification_jobs (bettor_address, market_id, job_type, status, created_at)
-         VALUES ($1, $2, $3, $4, NOW())`,
-        [bettor.bettor_address, marketId, 'market_resolved', 'pending']
+    if (existingMarket.status !== 'resolved') {
+      const { rows: bettors } = await client.query(
+        `SELECT DISTINCT bettor_address FROM bets WHERE market_id = $1`,
+        [marketId]
       );
+
+      for (const bettor of bettors) {
+        await client.query(
+          `INSERT INTO notification_jobs (bettor_address, market_id, job_type, status, created_at)
+           VALUES ($1, $2, $3, $4, NOW())`,
+          [bettor.bettor_address, marketId, 'market_resolved', 'pending']
+        );
+      }
+    }
+
+    const { rows: settledMarkets } = await client.query(
+      `SELECT status, outcome, resolved_at FROM markets WHERE market_id = $1`,
+      [marketId],
+    );
+    if (
+      settledMarkets.length !== 1 ||
+      settledMarkets[0].status !== 'resolved' ||
+      settledMarkets[0].outcome !== outcome ||
+      settledMarkets[0].resolved_at == null
+    ) {
+      throw new Error(`Market settlement consistency validation failed: ${marketId}`);
     }
 
     await client.query('COMMIT');

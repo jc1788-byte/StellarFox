@@ -1,0 +1,85 @@
+name: Technical debt
+description: Record an ongoing cost from a design or implementation shortcut
+title: "[Debt]: "
+labels:
+  - technical-debt
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for an ongoing cost caused by an implementation or design shortcut, not a feature request or a routine defect. Rate impact, likelihood, and urgency from 1 (lowest) to 5 (highest). Enter effort as a number of engineering days; fractions are allowed.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Current constraint and cost
+      description: What is the shortcut, where is it, and what measurable cost or risk does it create?
+      placeholder: Include code paths, incidents, frequency, affected users/systems, or delivery impact.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - backend
+        - frontend
+        - contracts
+        - indexer
+        - infrastructure
+        - cross-cutting
+        - other
+    validations:
+      required: true
+  - type: input
+    id: impact
+    attributes:
+      label: Impact
+      description: "1-5: cost if the risk occurs. See docs/technical-debt-management.md."
+      placeholder: "1-5"
+    validations:
+      required: true
+  - type: input
+    id: likelihood
+    attributes:
+      label: Likelihood
+      description: "1-5: chance or exposure. See docs/technical-debt-management.md."
+      placeholder: "1-5"
+    validations:
+      required: true
+  - type: input
+    id: urgency
+    attributes:
+      label: Urgency
+      description: "1-5: time sensitivity. Set to 5 for an active incident or immediate risk."
+      placeholder: "1-5"
+    validations:
+      required: true
+  - type: input
+    id: effort
+    attributes:
+      label: Effort (engineering days)
+      description: Estimate the smallest complete remediation, including tests and rollout.
+      placeholder: "e.g. 2.5"
+    validations:
+      required: true
+  - type: textarea
+    id: remediation
+    attributes:
+      label: Remediation plan
+      description: Describe bounded steps, owner, dependencies, and a review date.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria and validation
+      description: State observable completion criteria and how they will be verified.
+    validations:
+      required: true
+  - type: textarea
+    id: related
+    attributes:
+      label: Related work and priority override
+      description: Link related code, incidents, or issues. Explain any decision to prioritize differently from the score.
+    validations:
+      required: false

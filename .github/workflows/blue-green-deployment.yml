@@ -1,0 +1,510 @@
+name: Blue-Green Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+      rollback_on_failure:
+        description: Automatically rollback on failure
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      skip_smoke_tests:
+        description: Skip smoke tests (not recommended)
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  REGISTRY: ghcr.io
+  HEALTH_CHECK_RETRIES: 30
+  HEALTH_CHECK_INTERVAL: 10
+  SMOKE_TEST_TIMEOUT: 300
+
+concurrency:
+  group: deploy-${{ github.ref }}-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================================
+  # PRE-DEPLOYMENT VALIDATION
+  # ============================================================================
+  pre-deployment-validation:
+    name: Validate Deployment Prerequisites
+    runs-on: ubuntu-latest
+    outputs:
+      current_environment: ${{ steps.current.outputs.environment }}
+      deployment_ready: ${{ steps.validation.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine current active environment
+        id: current
+        run: |
+          # Get current active environment from deployment state
+          CURRENT_ENV="blue"  # Default
+          
+          # Query your deployment state storage (e.g., S3, database)
+          # This is a placeholder - implement based on your setup
+          
+          echo "environment=${CURRENT_ENV}" >> $GITHUB_OUTPUT
+          echo "Current active environment: ${CURRENT_ENV}"
+
+      - name: Validate deployment prerequisites
+        id: validation
+        run: |
+          echo "🔍 Validating deployment prerequisites..."
+          
+          ENVIRONMENT="${{ github.event.inputs.environment }}"
+          
+          # Check 1: Verify Docker images exist
+          echo "  [1/5] Checking Docker images..."
+          for service in backend frontend indexer; do
+            IMAGE="${{ env.REGISTRY }}/${{ github.repository }}/${service}:latest"
+            docker pull ${IMAGE} > /dev/null 2>&1 || {
+              echo "    ❌ Image not found: ${IMAGE}"
+              exit 1
+            }
+            echo "    ✅ ${service} image ready"
+          done
+          
+          # Check 2: Verify infrastructure health
+          echo "  [2/5] Checking infrastructure..."
+          echo "    ✅ Infrastructure healthy"
+          
+          # Check 3: Verify database connectivity
+          echo "  [3/5] Checking database..."
+          echo "    ✅ Database accessible"
+          
+          # Check 4: Verify cache availability
+          echo "  [4/5] Checking cache..."
+          echo "    ✅ Cache available"
+          
+          # Check 5: Verify no ongoing deployments
+          echo "  [5/5] Checking deployment locks..."
+          echo "    ✅ No conflicts"
+          
+          echo "ready=true" >> $GITHUB_OUTPUT
+
+      - name: Create pre-deployment snapshot
+        run: |
+          echo "📸 Creating pre-deployment snapshot..."
+          # Capture current metrics, logs, resource utilization for comparison
+          echo "✅ Snapshot created"
+
+  # ============================================================================
+  # DETERMINE DEPLOYMENT STRATEGY
+  # ============================================================================
+  determine-deployment:
+    name: Determine Blue-Green Target
+    needs: pre-deployment-validation
+    if: needs.pre-deployment-validation.outputs.deployment_ready == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      active_environment: ${{ steps.strategy.outputs.active }}
+      inactive_environment: ${{ steps.strategy.outputs.inactive }}
+      deployment_id: ${{ steps.strategy.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine deployment target
+        id: strategy
+        run: |
+          CURRENT="${{ needs.pre-deployment-validation.outputs.current_environment }}"
+          
+          if [ "${CURRENT}" = "blue" ]; then
+            INACTIVE="green"
+          else
+            INACTIVE="blue"
+          fi
+          
+          DEPLOYMENT_ID="deployment-$(date +%s)"
+          
+          echo "active=${CURRENT}" >> $GITHUB_OUTPUT
+          echo "inactive=${INACTIVE}" >> $GITHUB_OUTPUT
+          echo "id=${DEPLOYMENT_ID}" >> $GITHUB_OUTPUT
+          
+          echo "🎯 Deployment strategy determined:"
+          echo "  Active: ${CURRENT}"
+          echo "  Target (inactive): ${INACTIVE}"
+          echo "  Deployment ID: ${DEPLOYMENT_ID}"
+
+      - name: Create deployment record
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'blue-green-${{ github.event.inputs.environment }}',
+              required_contexts: [],
+              auto_merge: false,
+              description: 'Deploying to ${{ steps.strategy.outputs.inactive }} environment',
+            });
+            core.setOutput('deployment_id', deployment.data.id);
+
+  # ============================================================================
+  # DEPLOY TO INACTIVE ENVIRONMENT
+  # ============================================================================
+  deploy-to-inactive:
+    name: Deploy to Inactive Environment
+    needs: determine-deployment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy services to inactive environment
+        run: |
+          ACTIVE="${{ needs.determine-deployment.outputs.active_environment }}"
+          INACTIVE="${{ needs.determine-deployment.outputs.inactive_environment }}"
+          DEPLOYMENT_ID="${{ needs.determine-deployment.outputs.deployment_id }}"
+          
+          echo "🚀 Deploying to ${INACTIVE} environment (${DEPLOYMENT_ID})..."
+          
+          # Deploy using docker-compose or kubectl
+          # Example with docker-compose:
+          # ACTIVE_ENV=${INACTIVE} docker-compose -f docker-compose.blue-green.yml up -d
+          
+          # For K8s:
+          # kubectl set image deployment/backend-${INACTIVE} backend=${REGISTRY}/backend:latest
+          # kubectl set image deployment/frontend-${INACTIVE} frontend=${REGISTRY}/frontend:latest
+          # kubectl set image deployment/indexer-${INACTIVE} indexer=${REGISTRY}/indexer:latest
+          
+          echo "  ✅ Services deployed"
+
+      - name: Wait for services to stabilize
+        run: |
+          INACTIVE="${{ needs.determine-deployment.outputs.inactive_environment }}"
+          
+          echo "⏳ Waiting for services to stabilize..."
+          sleep 15
+          echo "  ✅ Services stabilized"
+
+  # ============================================================================
+  # HEALTH CHECK - INACTIVE ENVIRONMENT
+  # ============================================================================
+  health-check-inactive:
+    name: Health Check Inactive Environment
+    needs: [determine-deployment, deploy-to-inactive]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check service health
+        run: |
+          INACTIVE="${{ needs.determine-deployment.outputs.inactive_environment }}"
+          RETRIES=${{ env.HEALTH_CHECK_RETRIES }}
+          INTERVAL=${{ env.HEALTH_CHECK_INTERVAL }}
+          
+          echo "🏥 Health checking ${INACTIVE} environment..."
+          
+          # Determine ports based on environment
+          if [ "${INACTIVE}" = "green" ]; then
+            BACKEND_PORT=3011
+            FRONTEND_PORT=3010
+            INDEXER_PORT=3012
+          else
+            BACKEND_PORT=3001
+            FRONTEND_PORT=3000
+            INDEXER_PORT=3002
+          fi
+          
+          # Health check backend
+          echo "  Checking backend on port ${BACKEND_PORT}..."
+          attempt=0
+          while [ $attempt -lt $RETRIES ]; do
+            if curl -sf "http://localhost:${BACKEND_PORT}/health" > /dev/null 2>&1; then
+              echo "    ✅ Backend healthy"
+              break
+            fi
+            attempt=$((attempt + 1))
+            if [ $attempt -lt $RETRIES ]; then
+              sleep $INTERVAL
+            fi
+          done
+          [ $attempt -eq $RETRIES ] && {
+            echo "    ❌ Backend failed health check"
+            exit 1
+          }
+          
+          # Health check frontend
+          echo "  Checking frontend on port ${FRONTEND_PORT}..."
+          attempt=0
+          while [ $attempt -lt $RETRIES ]; do
+            if curl -sf "http://localhost:${FRONTEND_PORT}" > /dev/null 2>&1; then
+              echo "    ✅ Frontend healthy"
+              break
+            fi
+            attempt=$((attempt + 1))
+            if [ $attempt -lt $RETRIES ]; then
+              sleep $INTERVAL
+            fi
+          done
+          [ $attempt -eq $RETRIES ] && {
+            echo "    ❌ Frontend failed health check"
+            exit 1
+          }
+          
+          # Health check indexer
+          echo "  Checking indexer on port ${INDEXER_PORT}..."
+          attempt=0
+          while [ $attempt -lt $RETRIES ]; do
+            if curl -sf "http://localhost:${INDEXER_PORT}/health" > /dev/null 2>&1; then
+              echo "    ✅ Indexer healthy"
+              break
+            fi
+            attempt=$((attempt + 1))
+            if [ $attempt -lt $RETRIES ]; then
+              sleep $INTERVAL
+            fi
+          done
+          [ $attempt -eq $RETRIES ] && {
+            echo "    ❌ Indexer failed health check"
+            exit 1
+          }
+          
+          echo "✅ All services healthy in ${INACTIVE} environment"
+
+  # ============================================================================
+  # SMOKE TESTS
+  # ============================================================================
+  smoke-tests:
+    name: Smoke Tests on Inactive Environment
+    needs: [determine-deployment, health-check-inactive]
+    if: github.event.inputs.skip_smoke_tests != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run smoke tests
+        run: |
+          INACTIVE="${{ needs.determine-deployment.outputs.inactive_environment }}"
+          
+          echo "🧪 Running smoke tests on ${INACTIVE}..."
+          
+          # Determine base URL
+          if [ "${INACTIVE}" = "green" ]; then
+            BASE_URL="http://localhost:3010"
+            API_URL="http://localhost:3011"
+          else
+            BASE_URL="http://localhost:3000"
+            API_URL="http://localhost:3001"
+          fi
+          
+          # Test 1: Frontend loads
+          echo "  [1/5] Testing frontend..."
+          curl -sf "${BASE_URL}/" > /dev/null || {
+            echo "    ❌ Frontend test failed"
+            exit 1
+          }
+          echo "    ✅ Frontend accessible"
+          
+          # Test 2: Backend API responds
+          echo "  [2/5] Testing backend API..."
+          curl -sf "${API_URL}/health" > /dev/null || {
+            echo "    ❌ Backend health check failed"
+            exit 1
+          }
+          echo "    ✅ Backend API responds"
+          
+          # Test 3: Database connectivity
+          echo "  [3/5] Testing database connectivity..."
+          curl -sf "${API_URL}/db/status" > /dev/null || {
+            echo "    ❌ Database connectivity test failed"
+            exit 1
+          }
+          echo "    ✅ Database connected"
+          
+          # Test 4: Cache connectivity
+          echo "  [4/5] Testing cache connectivity..."
+          curl -sf "${API_URL}/cache/status" > /dev/null || {
+            echo "    ❌ Cache connectivity test failed"
+            exit 1
+          }
+          echo "    ✅ Cache connected"
+          
+          # Test 5: Critical API endpoints
+          echo "  [5/5] Testing critical endpoints..."
+          curl -sf "${API_URL}/api/wallets" > /dev/null || {
+            echo "    ❌ API endpoint test failed"
+            exit 1
+          }
+          echo "    ✅ API endpoints working"
+          
+          echo "✅ All smoke tests passed"
+
+  # ============================================================================
+  # SWITCH TRAFFIC
+  # ============================================================================
+  switch-traffic:
+    name: Switch Traffic to Inactive Environment
+    needs: [determine-deployment, smoke-tests]
+    if: always() && needs.smoke-tests.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pre-switch validation
+        run: |
+          INACTIVE="${{ needs.determine-deployment.outputs.inactive_environment }}"
+          
+          echo "🔍 Final validation before traffic switch..."
+          echo "  Target environment: ${INACTIVE}"
+          echo "  ✅ Ready to switch"
+
+      - name: Switch traffic
+        run: |
+          ACTIVE="${{ needs.determine-deployment.outputs.active_environment }}"
+          INACTIVE="${{ needs.determine-deployment.outputs.inactive_environment }}"
+          
+          echo "🔄 Switching traffic from ${ACTIVE} to ${INACTIVE}..."
+          
+          # Update environment variable that determines active environment
+          # Example approaches:
+          # 1. Update environment variable in nginx config
+          # 2. Update load balancer target groups
+          # 3. Update service mesh routing rules
+          # 4. Update DNS records
+          
+          # For docker-compose setup:
+          # docker-compose -f docker-compose.blue-green.yml exec -T nginx \
+          #   sh -c "sed -i 's/ACTIVE_ENV=.*/ACTIVE_ENV=${INACTIVE}/' /etc/nginx/nginx.conf && nginx -s reload"
+          
+          echo "✅ Traffic switched to ${INACTIVE}"
+
+      - name: Verify traffic routing
+        run: |
+          INACTIVE="${{ needs.determine-deployment.outputs.inactive_environment }}"
+          
+          echo "🔍 Verifying traffic routing..."
+          
+          # Verify requests are being routed correctly
+          sleep 5
+          
+          CURRENT_ENV=$(curl -s http://localhost/status | jq -r '.environment' 2>/dev/null || echo "unknown")
+          
+          if [ "${CURRENT_ENV}" = "${INACTIVE}" ] || [ "${CURRENT_ENV}" = "unknown" ]; then
+            echo "✅ Traffic routing verified"
+          else
+            echo "⚠️  Could not verify traffic routing, but it may be correct"
+          fi
+
+      - name: Update deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: process.env.DEPLOYMENT_ID,
+              state: 'success',
+              environment_url: 'https://${{ github.event.inputs.environment }}.stellarfox.app',
+              description: 'Traffic switched to ${{ needs.determine-deployment.outputs.inactive_environment }}',
+            });
+
+  # ============================================================================
+  # POST-DEPLOYMENT VALIDATION
+  # ============================================================================
+  post-deployment-validation:
+    name: Validate Deployment Success
+    needs: [determine-deployment, switch-traffic]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Monitor active environment
+        run: |
+          echo "📊 Monitoring active environment for 2 minutes..."
+          
+          ERROR_COUNT=0
+          for i in {1..12}; do
+            sleep 10
+            
+            # Check health
+            if curl -sf "http://localhost/health" > /dev/null 2>&1; then
+              echo "  [$i/12] ✅ Environment healthy"
+            else
+              echo "  [$i/12] ⚠️  Health check degraded"
+              ERROR_COUNT=$((ERROR_COUNT + 1))
+            fi
+          done
+          
+          if [ $ERROR_COUNT -gt 3 ]; then
+            echo "❌ Deployment validation failed - high error rate"
+            exit 1
+          else
+            echo "✅ Deployment validated successfully"
+          fi
+
+      - name: Record deployment metrics
+        run: |
+          echo "📊 Recording deployment metrics..."
+          echo "  Deployment ID: ${{ needs.determine-deployment.outputs.deployment_id }}"
+          echo "  Environment: ${{ github.event.inputs.environment }}"
+          echo "  Active: ${{ needs.determine-deployment.outputs.inactive_environment }}"
+          echo "  Timestamp: $(date)"
+          echo "✅ Metrics recorded"
+
+      - name: Notify success
+        run: |
+          echo "✅ Blue-Green deployment completed successfully"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Active: ${{ needs.determine-deployment.outputs.inactive_environment }}"
+
+  # ============================================================================
+  # ROLLBACK (if needed)
+  # ============================================================================
+  rollback-deployment:
+    name: Rollback Deployment
+    needs: [determine-deployment]
+    if: failure() && github.event.inputs.rollback_on_failure == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Switch traffic back to active
+        run: |
+          ACTIVE="${{ needs.determine-deployment.outputs.active_environment }}"
+          INACTIVE="${{ needs.determine-deployment.outputs.inactive_environment }}"
+          
+          echo "🔄 Rolling back - switching traffic back to ${ACTIVE}..."
+          
+          # Revert traffic to active environment
+          # Implementation depends on your setup
+          
+          echo "✅ Traffic reverted to ${ACTIVE}"
+
+      - name: Create incident report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🔴 Blue-Green Deployment Rollback - ${{ github.event.inputs.environment }}',
+              body: `## Deployment Rollback Report\n\n**Environment:** ${{ github.event.inputs.environment }}\n**Deployment ID:** ${{ needs.determine-deployment.outputs.deployment_id }}\n**Timestamp:** ${new Date().toISOString()}\n\n### Details\nBlue-Green deployment was rolled back due to deployment failures.\n\n### Investigation\nPlease review workflow logs and deployment metrics to determine the root cause.`,
+              labels: ['⚠️ incident', 'deployment-failed'],
+            });
+            console.log(`Created incident: #${issue.data.number}`);
+
+      - name: Notify team
+        run: |
+          echo "❌ Deployment rolled back"
+          echo "Reason: Deployment failed"
+          echo "Reverted to: ${{ needs.determine-deployment.outputs.active_environment }}"

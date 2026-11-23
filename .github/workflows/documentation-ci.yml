@@ -1,0 +1,45 @@
+name: Documentation CI
+
+on:
+  push:
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'indexer/**'
+      - 'contracts/**'
+      - 'docs/**'
+      - 'scripts/**'
+      - '.github/workflows/documentation-ci.yml'
+  pull_request:
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'indexer/**'
+      - 'contracts/**'
+      - 'docs/**'
+      - 'scripts/**'
+      - '.github/workflows/documentation-ci.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  documentation:
+    name: Documentation validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check TypeScript documentation coverage
+        run: npm run docs:check
+
+      - name: Check Rust public API documentation
+        working-directory: contracts
+        run: python3 scripts/check_rustdoc.py
+
+      - name: Build Rust API documentation
+        working-directory: contracts
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+        run: cargo doc --workspace --no-deps

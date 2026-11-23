@@ -4,9 +4,11 @@ on:
   push:
     paths:
       - 'frontend/**'
+      - 'package.json'
   pull_request:
     paths:
       - 'frontend/**'
+      - 'package.json'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -41,6 +43,10 @@ jobs:
         working-directory: frontend
         run: npm run lint
 
+      - name: Check code formatting
+        working-directory: frontend
+        run: npm run format:check
+
       - name: Type check
         working-directory: frontend
         run: npm run type-check
@@ -53,7 +59,15 @@ jobs:
 
       - name: Test
         working-directory: frontend
-        run: npm test
+        run: npm run test:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          retention-days: 7
 
       - name: Build
         working-directory: frontend
@@ -91,16 +105,22 @@ jobs:
           NEXT_PUBLIC_API_URL: http://localhost:3001
           NEXT_PUBLIC_STELLAR_NETWORK: testnet
 
-      - name: Start app in background
+      - name: Start app and wait for readiness
         working-directory: frontend
-        run: npm run start &
+        run: |
+          npm run start &
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://localhost:3000 >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Frontend did not become ready in time" >&2
+          exit 1
         env:
           PORT: 3000
           NEXT_PUBLIC_API_URL: http://localhost:3001
           NEXT_PUBLIC_STELLAR_NETWORK: testnet
-
-      - name: Wait for app to be ready
-        run: npx wait-on http://localhost:3000 --timeout 60000
 
       - name: Run Playwright E2E tests
         working-directory: frontend
@@ -114,4 +134,15 @@ jobs:
         with:
           name: playwright-traces
           path: frontend/test-results/
+          retention-days: 7
+
+      - name: Upload visual diff artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-diffs
+          path: |
+            frontend/test-results/**/*.png
+            frontend/test-results/**/*.zip
+          if-no-files-found: ignore
           retention-days: 7

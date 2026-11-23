@@ -1,5 +1,10 @@
 import { pool } from '../config/db';
+import { isMarketCategory } from '../models/MarketCategory';
 import { cacheDeletePattern } from '../services/cache.service';
+import { recordProbabilitySnapshot } from '../services/MarketService';
+import { sendToDLQ } from '../services/dlq.service';
+import { validateEvent } from '../services/schemaValidator.service';
+import { logger } from '../utils/logger';
 
 export interface RawStellarEvent {
   contract_address: string;
@@ -26,6 +31,19 @@ function parsePayload(data: string): Record<string, unknown> {
 export class StellarEventProcessor implements EventProcessor {
   async process(event: RawStellarEvent): Promise<void> {
     try {
+      // Validate event against schema
+      const validationResult = await validateEvent(event);
+      if (!validationResult.isValid) {
+        logger.warn(
+          {
+            txHash: event.tx_hash,
+            eventType: event.event_type,
+            errors: validationResult.errors,
+          },
+          'Event validation failed'
+        );
+      }
+
       const eventType = event.event_type;
 
       if (eventType === 'market_created') {
@@ -44,14 +62,28 @@ export class StellarEventProcessor implements EventProcessor {
         await this.handleRefundClaimed(event);
       } else {
         // Log unknown event types to prevent silent data loss
-        console.warn(
-          `[Indexer] Unknown event type "${eventType}" on contract ${event.contract_address} ` +
-          `(tx: ${event.tx_hash}, ledger: ${event.ledger_sequence}). ` +
-          `Full event payload: ${JSON.stringify(event)}`,
+        logger.warn(
+          {
+            eventType,
+            contractAddress: event.contract_address,
+            txHash: event.tx_hash,
+            ledgerSequence: event.ledger_sequence,
+          },
+          'Unknown event type'
         );
       }
     } catch (err) {
-      console.error(`Error processing event ${event.tx_hash}:`, err);
+      logger.error(
+        { txHash: event.tx_hash, err },
+        'Error processing event, sending to DLQ'
+      );
+      
+      // Send to DLQ for later retry
+      try {
+        await sendToDLQ(event, err);
+      } catch (dlqErr) {
+        logger.error({ txHash: event.tx_hash, dlqErr }, 'Failed to send event to DLQ');
+      }
     }
   }
 
@@ -65,6 +97,7 @@ export class StellarEventProcessor implements EventProcessor {
         match_id: p.match_id ?? '',
         fighter_a: p.fighter_a ?? '',
         fighter_b: p.fighter_b ?? '',
+        category: isMarketCategory(p.category) ? p.category : 'OTHER',
         weight_class: p.weight_class ?? '',
         title_fight: p.title_fight ?? false,
         venue: p.venue ?? '',
@@ -77,9 +110,9 @@ export class StellarEventProcessor implements EventProcessor {
 
       await pool.query(
         `INSERT INTO markets
-           (market_id, contract_address, match_id, fighter_a, fighter_b,
+           (market_id, contract_address, match_id, fighter_a, fighter_b, category,
             weight_class, title_fight, venue, scheduled_at, fee_bps, lock_before_secs, status, ledger_sequence)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
          ON CONFLICT (market_id) DO NOTHING`,
         [
           marketData.market_id,
@@ -87,6 +120,7 @@ export class StellarEventProcessor implements EventProcessor {
           marketData.match_id,
           marketData.fighter_a,
           marketData.fighter_b,
+          marketData.category,
           marketData.weight_class,
           marketData.title_fight,
           marketData.venue,
@@ -98,6 +132,7 @@ export class StellarEventProcessor implements EventProcessor {
         ]
       );
 
+      await recordProbabilitySnapshot(String(marketData.market_id));
       console.log(`[Indexer] Market created: ${marketData.market_id}`);
     } catch (err) {
       console.error(`[Indexer] Error handling MarketCreated event:`, err);
@@ -143,6 +178,7 @@ export class StellarEventProcessor implements EventProcessor {
     } finally {
       client.release();
     }
+    await recordProbabilitySnapshot(String(p.market_id));
   }
 
   private async handleMarketLocked(event: RawStellarEvent): Promise<void> {
@@ -150,6 +186,7 @@ export class StellarEventProcessor implements EventProcessor {
     await pool.query(`UPDATE markets SET status = 'locked', updated_at = NOW() WHERE market_id = $1`, [
       p.market_id,
     ]);
+    await recordProbabilitySnapshot(String(p.market_id));
   }
 
   private async handleMarketResolved(event: RawStellarEvent): Promise<void> {
@@ -192,6 +229,8 @@ export class StellarEventProcessor implements EventProcessor {
     } finally {
       client.release();
     }
+
+    await recordProbabilitySnapshot(String(p.market_id));
 
     // Gamification: credit prediction streaks to winning bettors and broadcast
     // real-time leaderboard rank updates.
@@ -250,6 +289,7 @@ export class StellarEventProcessor implements EventProcessor {
     } finally {
       client.release();
     }
+    await recordProbabilitySnapshot(String(p.market_id));
   }
 
   private async handleWinningsClaimed(event: RawStellarEvent): Promise<void> {

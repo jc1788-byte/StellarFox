@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Monthly cost alerts and daily Compute Optimizer recommendations for this AWS account.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address for budget, anomaly, and optimization notifications.
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    ConstraintDescription: Enter a valid email address.
+  MonthlyBudgetUsd:
+    Type: Number
+    Description: Monthly account cost budget in USD.
+    MinValue: 1
+  AnomalyThresholdUsd:
+    Type: Number
+    Description: Minimum daily cost anomaly in USD that triggers an email.
+    MinValue: 1
+    Default: 10
+
+Resources:
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+        BudgetName: !Sub '${AWS::StackName}-monthly-cost'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        CostTypes:
+          IncludeCredit: false
+          IncludeDiscount: true
+          IncludeOtherSubscription: true
+          IncludeRecurring: true
+          IncludeRefund: false
+          IncludeSubscription: true
+          IncludeSupport: true
+          IncludeTax: true
+          IncludeUpfront: true
+          UseAmortized: false
+          UseBlended: false
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref AlertEmail
+              SubscriptionType: EMAIL
+
+  CostAnomalyMonitor:
+    Type: AWS::CE::AnomalyMonitor
+    Properties:
+      MonitorName: !Sub '${AWS::StackName}-service-costs'
+      MonitorType: DIMENSIONAL
+      MonitorDimension: SERVICE
+
+  CostAnomalySubscription:
+    Type: AWS::CE::AnomalySubscription
+    Properties:
+      Frequency: DAILY
+      MonitorArnList:
+        - !Ref CostAnomalyMonitor
+      Subscribers:
+        - Address: !Ref AlertEmail
+          Type: EMAIL
+      SubscriptionName: !Sub '${AWS::StackName}-daily-cost-anomalies'
+      Threshold: !Ref AnomalyThresholdUsd
+
+  RecommendationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AWS cost optimization recommendations
+      TopicName: !Sub '${AWS::StackName}-cost-recommendations'
+
+  RecommendationEmail:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref AlertEmail
+      Protocol: email
+      TopicArn: !Ref RecommendationTopic
+
+  RecommendationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-cost-optimizer-report'
+      RetentionInDays: 14
+
+  RecommendationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadRecommendationsAndPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - compute-optimizer:GetEC2InstanceRecommendations
+                  - compute-optimizer:GetEBSVolumeRecommendations
+                Resource: '*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref RecommendationTopic
+
+  RecommendationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RecommendationLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-cost-optimizer-report'
+      Description: Sends daily EC2 and EBS cost optimization recommendations.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt RecommendationRole.Arn
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref RecommendationTopic
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+
+          optimizer = boto3.client("compute-optimizer")
+          sns = boto3.client("sns")
+
+          def recommendations(operation, result_key):
+              items = []
+              token = None
+              while True:
+                  request = {"maxResults": 100}
+                  if token:
+                      request["nextToken"] = token
+                  page = getattr(optimizer, operation)(**request)
+                  items.extend(page.get(result_key, []))
+                  token = page.get("nextToken")
+                  if not token:
+                      return items
+
+          def monthly_savings(option):
+              opportunity = option.get("savingsOpportunity", {})
+              amount = opportunity.get("estimatedMonthlySavings", {})
+              if amount.get("value") is None:
+                  return ""
+              return " (estimated savings: {:.2f} {}/month)".format(
+                  amount["value"], amount.get("currency", "USD")
+              )
+
+          def lambda_handler(event, context):
+              try:
+                  instances = recommendations(
+                      "get_ec2_instance_recommendations", "instanceRecommendations"
+                  )
+                  volumes = recommendations(
+                      "get_ebs_volume_recommendations", "volumeRecommendations"
+                  )
+              except ClientError as error:
+                  code = error.response.get("Error", {}).get("Code", "Unknown")
+                  sns.publish(
+                      TopicArn=os.environ["TOPIC_ARN"],
+                      Subject="AWS cost recommendations could not be collected",
+                      Message=(
+                          "Compute Optimizer recommendation collection failed with {}. "
+                          "Check that Compute Optimizer is enrolled in this region and "
+                          "that the recommendation IAM actions are available."
+                      ).format(code),
+                  )
+                  raise
+
+              lines = []
+              for item in instances:
+                  if item.get("finding") != "OVER_PROVISIONED":
+                      continue
+                  current = item.get("currentInstanceType", "unknown")
+                  options = item.get("recommendationOptions", [])
+                  best = options[0].get("instanceType", "unknown") if options else "unknown"
+                  line = "EC2 {}: {} -> {}".format(
+                      item.get("instanceArn", "unknown"), current, best
+                  )
+                  if options:
+                      line += monthly_savings(options[0])
+                  lines.append(line)
+
+              for item in volumes:
+                  if item.get("finding") != "NotOptimized":
+                      continue
+                  options = item.get("volumeRecommendationOptions", [])
+                  current = item.get("currentConfiguration", {})
+                  best = options[0] if options else {}
+                  current_desc = "{} {} GiB".format(
+                      current.get("volumeType", "unknown"), current.get("volumeSize", "?")
+                  )
+                  best_desc = "{} {} GiB".format(
+                      best.get("volumeType", "unknown"), best.get("volumeSize", "?")
+                  )
+                  line = "EBS {}: {} -> {}".format(
+                      item.get("volumeArn", "unknown"), current_desc, best_desc
+                  )
+                  if options:
+                      line += monthly_savings(options[0])
+                  lines.append(line)
+
+              recommendation_count = len(lines)
+              if not lines:
+                  lines.append(
+                      "No over-provisioned EC2 instances or non-optimized EBS volumes "
+                      "were reported in this region."
+                  )
+
+              message = "Daily AWS Compute Optimizer report ({}):\n\n{}".format(
+                  os.environ.get("AWS_REGION", "current region"), "\n".join(lines[:40])
+              )
+              if len(lines) > 40:
+                  message += "\n\n{} additional recommendations omitted.".format(
+                      len(lines) - 40
+                  )
+              sns.publish(
+                  TopicArn=os.environ["TOPIC_ARN"],
+                  Subject="Daily AWS cost optimization recommendations",
+                  Message=message,
+              )
+              return {"recommendations": recommendation_count}
+
+  RecommendationSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Runs the Compute Optimizer cost report once per day.
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RecommendationFunction.Arn
+          Id: CostOptimizerReport
+
+  AllowScheduleInvocation:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RecommendationFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RecommendationSchedule.Arn
+
+Outputs:
+  RecommendationTopicArn:
+    Description: SNS topic receiving daily optimization recommendations.
+    Value: !Ref RecommendationTopic

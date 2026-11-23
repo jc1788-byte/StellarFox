@@ -162,3 +162,20 @@ export function getInvoices(filters: { status?: string, freelancer?: string, pay
 export function getInvoiceById(id: string): InvoiceRecord | undefined {
   return db.prepare('SELECT * FROM invoices WHERE id = ?').get(id) as InvoiceRecord | undefined;
 }
+
+/**
+ * Health check for database connectivity
+ */
+export async function checkDatabaseHealth(): Promise<{ healthy: boolean; error?: string }> {
+  try {
+    const database = getDb();
+    // Simple query to verify database is responsive
+    const result = database.prepare('SELECT COUNT(*) as count FROM invoices').get() as any;
+    return { healthy: true };
+  } catch (err) {
+    return {
+      healthy: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}

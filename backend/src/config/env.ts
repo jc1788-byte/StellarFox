@@ -5,6 +5,8 @@ const envSchema = z.object({
   DATABASE_URL: z.string().url('DATABASE_URL must be a valid URL'),
   REDIS_URL: z.string().url('REDIS_URL must be a valid URL'),
   STELLAR_RPC_URL: z.string().url('STELLAR_RPC_URL must be a valid URL'),
+  RPC_PROVIDERS: z.string().optional(),
+  RPC_HEALTH_CHECK_INTERVAL_MS: z.coerce.number().int().positive().default(30000),
   ORACLE_PRIVATE_KEY: z
     .string()
     .min(1, 'ORACLE_PRIVATE_KEY is required')
@@ -30,6 +32,8 @@ const envSchema = z.object({
   ADMIN_PUBLIC_KEY: z.string().optional(),
   TREASURY_CONTRACT_ADDRESS: z.string().optional(),
   ORACLE_API_KEY: z.string().optional(),
+  ORACLE_UPDATE_LIMIT: z.coerce.number().int().positive().default(1),
+  ORACLE_UPDATE_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
   ENABLE_SWAGGER: z.coerce.boolean().default(false),
   GENESIS_LEDGER: z.coerce.number().int().positive().default(100000),
@@ -42,6 +46,15 @@ const envSchema = z.object({
   DB_POOL_CONNECTION_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   ALLOWED_ORIGINS: z.string().default('http://localhost:3000'),
   MAX_EXPORT_ROWS: z.coerce.number().int().positive().default(1000000),
+  BATCH_PROCESSOR_ENABLED: z.coerce.boolean().default(true),
+  BATCH_PROCESSOR_SIZE: z.coerce.number().int().positive().default(10),
+  BATCH_PROCESSOR_MIN_SIZE: z.coerce.number().int().positive().default(5),
+  BATCH_PROCESSOR_MAX_SIZE: z.coerce.number().int().positive().default(100),
+  BATCH_PROCESSOR_CONCURRENCY: z.coerce.number().int().positive().default(3),
+  BATCH_PROCESSOR_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  DLQ_ENABLED: z.coerce.boolean().default(true),
+  DLQ_MAX_RETRIES: z.coerce.number().int().positive().default(5),
+  SCHEMA_VALIDATION_ENABLED: z.coerce.boolean().default(true),
 });
 
 export type Env = z.infer<typeof envSchema>;

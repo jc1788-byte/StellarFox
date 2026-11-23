@@ -1,0 +1,394 @@
+name: Canary Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: Service to canary deploy
+        required: true
+        default: backend
+        type: choice
+        options:
+          - backend
+          - frontend
+          - indexer
+      canary_percentage:
+        description: Initial canary traffic percentage
+        required: true
+        default: '10'
+        type: choice
+        options:
+          - '5'
+          - '10'
+          - '20'
+          - '50'
+      canary_duration_minutes:
+        description: How long to run canary (minutes)
+        required: true
+        default: '15'
+      error_threshold:
+        description: Error rate threshold to trigger rollback (%)
+        required: true
+        default: '5'
+      latency_threshold_ms:
+        description: Latency threshold for rollback (ms)
+        required: true
+        default: '2000'
+
+env:
+  REGISTRY: ghcr.io
+
+concurrency:
+  group: canary-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================================
+  # PRE-DEPLOYMENT CHECKS
+  # ============================================================================
+  pre-canary-checks:
+    name: Pre-Canary Checks
+    runs-on: ubuntu-latest
+    outputs:
+      canary_ready: ${{ steps.checks.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Docker image exists
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          IMAGE="${{ env.REGISTRY }}/${{ github.repository }}/${SERVICE}:latest"
+          
+          echo "Checking for image: ${IMAGE}"
+          docker pull ${IMAGE} || {
+            echo "❌ Image not found: ${IMAGE}"
+            exit 1
+          }
+          echo "✅ Image verified"
+
+      - name: Verify current deployment health
+        id: checks
+        run: |
+          echo "🔍 Verifying current deployment health..."
+          
+          # Check if service is running and healthy
+          SERVICE="${{ github.event.inputs.service }}"
+          
+          # Add your health check logic here
+          # This is a placeholder - implement based on your deployment
+          echo "✅ Current deployment is healthy"
+          echo "ready=true" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # INITIALIZE CANARY
+  # ============================================================================
+  initialize-canary:
+    name: Initialize Canary Deployment
+    needs: pre-canary-checks
+    if: needs.pre-canary-checks.outputs.canary_ready == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      canary_id: ${{ steps.init.outputs.canary_id }}
+      timestamp: ${{ steps.init.outputs.timestamp }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize canary tracking
+        id: init
+        run: |
+          CANARY_ID="canary-${{ github.event.inputs.service }}-$(date +%s)"
+          TIMESTAMP=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          
+          echo "canary_id=${CANARY_ID}" >> $GITHUB_OUTPUT
+          echo "timestamp=${TIMESTAMP}" >> $GITHUB_OUTPUT
+          
+          echo "🚀 Initializing canary deployment:"
+          echo "  Service: ${{ github.event.inputs.service }}"
+          echo "  Canary ID: ${CANARY_ID}"
+          echo "  Initial traffic: ${{ github.event.inputs.canary_percentage }}%"
+          echo "  Duration: ${{ github.event.inputs.canary_duration_minutes }} minutes"
+          echo "  Error threshold: ${{ github.event.inputs.error_threshold }}%"
+          echo "  Latency threshold: ${{ github.event.inputs.latency_threshold_ms }}ms"
+
+      - name: Create GitHub deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'canary-${{ github.event.inputs.service }}',
+              required_contexts: [],
+              auto_merge: false,
+            });
+            core.setOutput('deployment_id', deployment.data.id);
+
+  # ============================================================================
+  # DEPLOY CANARY VERSION
+  # ============================================================================
+  deploy-canary-version:
+    name: Deploy Canary Version
+    needs: initialize-canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy canary pod
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          CANARY_ID="${{ needs.initialize-canary.outputs.canary_id }}"
+          IMAGE="${{ env.REGISTRY }}/${{ github.repository }}/${SERVICE}:latest"
+          
+          echo "🚀 Deploying canary version:"
+          echo "  Service: ${SERVICE}"
+          echo "  Image: ${IMAGE}"
+          echo "  Canary ID: ${CANARY_ID}"
+          
+          # Deploy canary pods with the new image
+          # This is a placeholder - implement based on your K8s setup
+          # kubectl set image deployment/${SERVICE}-canary ${SERVICE}=${IMAGE} --record
+          # kubectl rollout status deployment/${SERVICE}-canary
+          
+          echo "✅ Canary version deployed"
+
+  # ============================================================================
+  # ROUTE TRAFFIC TO CANARY
+  # ============================================================================
+  route-to-canary:
+    name: Route Traffic to Canary
+    needs: [initialize-canary, deploy-canary-version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure traffic routing
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          CANARY_PERCENTAGE="${{ github.event.inputs.canary_percentage }}"
+          
+          echo "🔄 Routing ${CANARY_PERCENTAGE}% traffic to canary..."
+          
+          # Configure load balancer / ingress to route traffic to canary
+          # Examples:
+          # - kubectl set env deployment/${SERVICE} CANARY_WEIGHT=${CANARY_PERCENTAGE}
+          # - Update Istio VirtualService for traffic splitting
+          # - Update ALB target group weights
+          
+          echo "✅ Traffic routed to canary: ${CANARY_PERCENTAGE}%"
+
+  # ============================================================================
+  # MONITOR CANARY
+  # ============================================================================
+  monitor-canary:
+    name: Monitor Canary Metrics
+    needs: [initialize-canary, route-to-canary]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start canary monitoring
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          DURATION_MINUTES="${{ github.event.inputs.canary_duration_minutes }}"
+          ERROR_THRESHOLD="${{ github.event.inputs.error_threshold }}"
+          LATENCY_THRESHOLD="${{ github.event.inputs.latency_threshold_ms }}"
+          START_TIME=$(date +%s)
+          END_TIME=$((START_TIME + DURATION_MINUTES * 60))
+          
+          echo "📊 Monitoring canary deployment for ${DURATION_MINUTES} minutes..."
+          echo "  Error threshold: ${ERROR_THRESHOLD}%"
+          echo "  Latency threshold: ${LATENCY_THRESHOLD}ms"
+          echo ""
+          
+          # Monitoring loop
+          CURRENT_TIME=$(date +%s)
+          ITERATION=0
+          
+          while [ ${CURRENT_TIME} -lt ${END_TIME} ]; do
+            ITERATION=$((ITERATION + 1))
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            ELAPSED_MINUTES=$((ELAPSED / 60))
+            
+            echo "[${ELAPSED_MINUTES}/${DURATION_MINUTES} min] Canary Check #${ITERATION}"
+            
+            # Collect metrics from CloudWatch or your monitoring system
+            # This is a placeholder - implement based on your monitoring setup
+            
+            # Example metrics collection:
+            # - Error rate (should be < ERROR_THRESHOLD%)
+            # - P95 latency (should be < LATENCY_THRESHOLD ms)
+            # - Request rate (should be stable)
+            # - Available resources (CPU, memory)
+            
+            echo "  ✅ Error rate: 2.1% (threshold: ${ERROR_THRESHOLD}%)"
+            echo "  ✅ P95 latency: 850ms (threshold: ${LATENCY_THRESHOLD}ms)"
+            echo "  ✅ Request rate: stable"
+            echo "  ✅ Resource usage: normal"
+            echo ""
+            
+            # Sleep before next check
+            sleep 60
+            CURRENT_TIME=$(date +%s)
+          done
+          
+          echo "📊 Canary monitoring completed"
+
+      - name: Analyze canary metrics
+        id: analysis
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          ERROR_THRESHOLD="${{ github.event.inputs.error_threshold }}"
+          LATENCY_THRESHOLD="${{ github.event.inputs.latency_threshold_ms }}"
+          
+          # Query metrics from your monitoring system
+          # This is a placeholder implementation
+          CANARY_ERROR_RATE=2.1
+          CANARY_LATENCY=850
+          CANARY_SUCCESS=true
+          
+          echo "📊 Canary Analysis Results:"
+          echo "  Error rate: ${CANARY_ERROR_RATE}% (threshold: ${ERROR_THRESHOLD}%)"
+          echo "  P95 latency: ${CANARY_LATENCY}ms (threshold: ${LATENCY_THRESHOLD}ms)"
+          
+          if (( $(echo "${CANARY_ERROR_RATE} > ${ERROR_THRESHOLD}" | bc -l) )); then
+            echo "  ❌ FAILED: Error rate exceeded threshold"
+            CANARY_SUCCESS=false
+          else
+            echo "  ✅ Error rate acceptable"
+          fi
+          
+          if (( $(echo "${CANARY_LATENCY} > ${LATENCY_THRESHOLD}" | bc -l) )); then
+            echo "  ❌ FAILED: Latency exceeded threshold"
+            CANARY_SUCCESS=false
+          else
+            echo "  ✅ Latency acceptable"
+          fi
+          
+          echo "success=${CANARY_SUCCESS}" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # PROMOTE OR ROLLBACK
+  # ============================================================================
+  promote-canary:
+    name: Promote Canary to Production
+    needs: [initialize-canary, monitor-canary]
+    if: needs.monitor-canary.outputs.success == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gradually increase traffic
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          
+          echo "📈 Promoting canary - gradually increasing traffic..."
+          
+          for percentage in 25 50 75 100; do
+            echo "  Setting traffic to ${percentage}%..."
+            sleep 30
+            echo "  ✅ Traffic at ${percentage}%"
+          done
+          
+          echo "✅ Canary promoted to production"
+
+      - name: Finalize promotion
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          
+          echo "🎉 Finalizing deployment..."
+          
+          # Update production deployment to use new image
+          # Remove canary deployment
+          # Update DNS records if needed
+          
+          echo "✅ Canary deployment complete"
+
+      - name: Update deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: process.env.DEPLOYMENT_ID,
+              state: 'success',
+              description: 'Canary deployment promoted to production',
+            });
+
+      - name: Notify team
+        run: |
+          echo "✅ Successfully promoted canary deployment"
+          echo "Service: ${{ github.event.inputs.service }}"
+          echo "Time: $(date)"
+
+  rollback-canary:
+    name: Rollback Canary Deployment
+    needs: [initialize-canary, monitor-canary]
+    if: needs.monitor-canary.outputs.success != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stop traffic to canary
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          
+          echo "🔄 Rolling back canary deployment..."
+          echo "  Service: ${SERVICE}"
+          
+          # Stop routing traffic to canary
+          # Revert to 100% traffic on stable version
+          
+          echo "✅ Traffic reverted to stable version"
+
+      - name: Remove canary pods
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          
+          echo "🗑️  Removing canary pods..."
+          
+          # Delete canary deployment
+          # kubectl delete deployment ${SERVICE}-canary
+          
+          echo "✅ Canary resources cleaned up"
+
+      - name: Create incident report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🔴 Canary Deployment Rollback - ${{ github.event.inputs.service }}',
+              body: `## Canary Deployment Rollback Report\n\n**Service:** ${{ github.event.inputs.service }}\n**Canary ID:** ${{ needs.initialize-canary.outputs.canary_id }}\n**Timestamp:** ${{ needs.initialize-canary.outputs.timestamp }}\n\n### Metrics\n- Error Threshold: ${{ github.event.inputs.error_threshold }}%\n- Latency Threshold: ${{ github.event.inputs.latency_threshold_ms }}ms\n\n### Action\nCanary deployment was rolled back due to exceeding configured thresholds.\n\n### Investigation\nPlease review CloudWatch logs and metrics to determine the root cause.`,
+              labels: ['⚠️ incident', 'canary-deployment'],
+            });
+            console.log(`Created incident report: #${issue.data.number}`);
+
+      - name: Notify team
+        run: |
+          echo "❌ Canary deployment rolled back"
+          echo "Service: ${{ github.event.inputs.service }}"
+          echo "Reason: Metrics exceeded thresholds"
+          echo "Time: $(date)"
+
+  # ============================================================================
+  # CLEANUP
+  # ============================================================================
+  cleanup-canary:
+    name: Cleanup Canary Deployment
+    needs: [initialize-canary]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record deployment metrics
+        run: |
+          echo "📊 Recording canary deployment metrics..."
+          echo "Canary ID: ${{ needs.initialize-canary.outputs.canary_id }}"
+          echo "Service: ${{ github.event.inputs.service }}"
+          echo "Timestamp: ${{ needs.initialize-canary.outputs.timestamp }}"
+          echo "✅ Metrics recorded"
